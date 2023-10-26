@@ -6,10 +6,12 @@ except ImportError:
     # Python 3
     pass
 import copy
+import warnings
 import numpy as np
 import rosbag
 import rospy
 import tf
+import tf2_py as tf2
 from std_msgs.msg import Header
 from geometry_msgs.msg import TransformStamped, Transform, Vector3, Quaternion
 
@@ -28,11 +30,11 @@ class BagTfTransformer(object):
         if type(bag) == str:
             bag = rosbag.Bag(bag)
         self.tf_messages = sorted(
-            (self._remove_slash_from_frames(tm) for m in bag if m.topic.strip("/") == 'tf' for tm in
+            (self._remove_slash_from_frames(tm) for m in bag.read_messages("/tf") for tm in
              m.message.transforms),
             key=lambda tfm: tfm.header.stamp.to_nsec())
         self.tf_static_messages = sorted(
-            (self._remove_slash_from_frames(tm) for m in bag if m.topic.strip("/") == 'tf_static' for tm in
+            (self._remove_slash_from_frames(tm) for m in bag.read_messages("/tf_static") for tm in
              m.message.transforms),
             key=lambda tfm: tfm.header.stamp.to_nsec())
 
@@ -72,15 +74,15 @@ class BagTfTransformer(object):
         ret = (self.tf_messages[i] for i in indices_in_range[0])
         return ret
 
-    def populateTransformerAtTime(self, target_time, buffer_length=10, lookahead=0.1):
+    def populateTransformerAtTime(self, target_time, buffer_length=1, lookahead=0.1):
         """
         Fills the buffer of the internal tf Transformer with the messages preceeding the given time
 
         :param target_time: the time at which the Transformer is going to be queried at next
-        :param buffer_length: the length of the buffer, in seconds (default: 10, maximum for tf TransformerBuffer)
+        :param buffer_length: the length of the buffer, in seconds (default: 1, maximum for tf TransformerBuffer)
         """
         target_start_time = target_time - rospy.Duration(
-            min(min(buffer_length, 10) - lookahead, target_time.to_sec()))  # max buffer length of tf Transformer
+            min(min(buffer_length, 1) - lookahead, target_time.to_sec()))  # max buffer length of tf Transformer
         target_end_time = target_time + rospy.Duration(lookahead)  # lookahead is there for numerical stability
         # otherwise, messages exactly around that time could be discarded
         previous_start_time, previous_end_time = self.last_population_range
@@ -92,11 +94,13 @@ class BagTfTransformer(object):
             population_start_time = max(target_start_time, previous_end_time)
 
         tf_messages_in_interval = self.getMessagesInTimeRange(population_start_time, target_end_time)
-        for m in tf_messages_in_interval:
-            self.transformer.setTransform(m)
-        for st_tfm in self.tf_static_messages:
-            st_tfm.header.stamp = target_time
-            self.transformer._buffer.set_transform_static(st_tfm, "default_authority")
+        with warnings.catch_warnings(): # suppress harmless warning from tf
+            warnings.simplefilter("ignore")
+            for m in tf_messages_in_interval:
+                self.transformer.setTransform(m)
+            for st_tfm in self.tf_static_messages:
+                st_tfm.header.stamp = target_time
+                self.transformer._buffer.set_transform_static(st_tfm, "default_authority")
 
         self.last_population_range = (target_start_time, target_end_time)
 
@@ -292,26 +296,31 @@ class BagTfTransformer(object):
             raise ValueError('Transform not found between {} and {}'.format(orig_frame, dest_frame))
         return ret
 
-    def lookupTransform(self, orig_frame, dest_frame, time):
+    def lookupTransform(self, orig_frame, dest_frame, time, timeout=1):
         """
         Returns the transform between the two provided frames at the given time
 
         :param orig_frame: the source tf frame of the transform of interest
         :param dest_frame: the target tf frame of the transform of interest
         :param time: the first time at which the messages should be considered; if None, all recorded messages
-        :return: the ROS time at which the transform is available
+        :param timeout: bi-directional timeout for the lookup in seconds
+        :return: the transform from orig_frame to dest_frame as a tuple (translation, rotation)
         """
         if orig_frame == dest_frame:
             return (0, 0, 0), (0, 0, 0, 1)
 
-        self.populateTransformerAtTime(time)
+        self.populateTransformerAtTime(time, buffer_length=timeout)
         try:
             common_time = self.transformer.getLatestCommonTime(orig_frame, dest_frame)
         except:
-            raise RuntimeError('Could not find the transformation {} -> {} in the 10 seconds before time {}'
-                               .format(orig_frame, dest_frame, time))
+            raise tf2.LookupException('Could not find the transformation {} -> {} in the {} seconds before time {}'
+                                      .format(orig_frame, dest_frame, timeout, time.to_sec()))
 
-        return self.transformer.lookupTransform(orig_frame, dest_frame, common_time)
+        if (time - common_time) > rospy.Duration(timeout):
+            raise tf2.LookupException('Could not find the transformation {} -> {} in the {} seconds after time {}'
+                                      .format(orig_frame, dest_frame, timeout, time.to_sec()))
+
+        return self.transformer.lookupTransform(dest_frame, orig_frame, common_time)
 
     def lookupTransformWhenTransformUpdates(self, orig_frame, dest_frame,
                                             trigger_orig_frame=None, trigger_dest_frame=None,
